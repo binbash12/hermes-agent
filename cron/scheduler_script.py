@@ -445,6 +445,7 @@ def _script_argv(
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -455,7 +456,8 @@ def _run_job_script(
     Absolute and ~-prefixed paths are also validated to ensure they stay within the scripts dir. workdir:
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
-    ``.py`` scripts (#8714).
+    ``.py`` scripts (#8714). extra_env: optional overlay applied after the platform env overlay
+    (e.g. ``HERMES_CRON_OUTPUT_PATH`` for post_script).
     """
     from tools.hosted_tool_policy import host_feature_refusal
     if refusal := host_feature_refusal("cron_scripts", "A cron script"):
@@ -497,6 +499,8 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        if extra_env:
+            env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -571,6 +575,7 @@ def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while heartbeating its owned one-shot claim. A long script can outlive
     the stale-claim TTL; without a heartbeat another scheduler would re-dispatch the one-shot.
@@ -578,7 +583,7 @@ def _run_job_script_with_claim_heartbeat(
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), extra_env=extra_env)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
@@ -610,6 +615,98 @@ def _run_job_script_with_claim_heartbeat(
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.
         heartbeat_thread.join(timeout=1.0)
+
+
+def _post_script_when(job: dict) -> str:
+    """Normalize ``post_script_when``; default ``after_agent``."""
+    raw = str(job.get("post_script_when") or "after_agent").strip().lower().replace("-", "_")
+    if raw in {"after_agent", "always"}:
+        return raw
+    return "after_agent"
+
+
+def should_run_post_script(job: dict, *, final_response: str | None) -> bool:
+    """True when this job declares a post_script that should run for this fire.
+
+    ``after_agent`` (default) skips when the agent was not run (wake-gate /
+    empty-payload ``[SILENT]`` short-circuit). ``always`` runs whenever a wrap
+    was saved. Post-script failure must not fail the cron tick.
+    """
+    script = str(job.get("post_script") or "").strip()
+    if not script:
+        return False
+    when = _post_script_when(job)
+    if when == "always":
+        return True
+    # after_agent — agent skipped => SILENT_MARKER from prepare/run short-circuits.
+    # Must match cron.scheduler.SILENT_MARKER ("[SILENT]") without importing
+    # scheduler (circular: scheduler imports this module at load time).
+    if (final_response or "") == "[SILENT]":
+        return False
+    return True
+
+
+def run_post_script(
+    job: dict,
+    output_path: str | Path,
+    *,
+    workdir: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+) -> tuple[bool, str]:
+    """Run ``job['post_script']`` with ``HERMES_CRON_OUTPUT_PATH`` set to the saved wrap.
+
+    Returns ``(ok, detail)``. Never raises — callers record ``last_post_error``.
+    """
+    script = str(job.get("post_script") or "").strip()
+    if not script:
+        return True, "no_post_script"
+    extra = {
+        "HERMES_CRON_OUTPUT_PATH": str(output_path),
+        "HERMES_CRON_JOB_ID": str(job.get("id") or ""),
+        "HERMES_CRON_JOB_NAME": str(job.get("name") or ""),
+    }
+    try:
+        return _run_job_script_with_claim_heartbeat(
+            job, script, workdir=workdir, cancel_event=cancel_event, extra_env=extra,
+        )
+    except Exception as exc:
+        return False, f"post_script execution failed: {exc}"
+
+
+def maybe_run_post_script(
+    job: dict,
+    output_path: str | Path,
+    *,
+    final_response: str | None,
+    workdir: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+) -> Optional[tuple[bool, str]]:
+    """Run post_script when configured for this fire; else return None.
+
+    On run, persists ``last_post_error`` (cleared on success). Failures are
+    logged and returned but do not raise.
+    """
+    if not should_run_post_script(job, final_response=final_response):
+        return None
+    ok, detail = run_post_script(
+        job, output_path, workdir=workdir, cancel_event=cancel_event,
+    )
+    try:
+        from cron.jobs import update_job
+        update_job(
+            str(job.get("id") or ""),
+            {"last_post_error": None if ok else (detail or "post_script failed")[:2000]},
+        )
+    except Exception:
+        logger.debug("Failed to record last_post_error for job %s", job.get("id"), exc_info=True)
+    hint = str(job.get("post_script") or "").strip() or "?"
+    if ok:
+        logger.info("Job '%s': post_script ok (%s)", job.get("id"), hint)
+    else:
+        logger.warning(
+            "Job '%s': post_script failed — %s", job.get("id"), (detail or "")[:300],
+        )
+    return ok, detail
 
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully

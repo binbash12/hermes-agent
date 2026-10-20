@@ -3139,6 +3139,12 @@ def _save_compose_deliver(
     if verbose and output_file is not None:
         logger.info("Output saved to: %s", output_file)
 
+    # After-agent post_script (optional job field). Runs only after the wrap is
+    # on disk so consumers like Electrum finalize can read HERMES_CRON_OUTPUT_PATH.
+    # Failures are recorded as last_post_error and never fail the cron tick.
+    if output_file is not None:
+        maybe_run_post_script(job, output_file, final_response=final_response)
+
     # A shutdown-killed tool subprocess can leave a plausible final_response from truncated
     # output; force the honest "interrupted" failure path. Peek-only (consumed later).
     if d.success and _is_interrupted(job["id"], execution_token):
@@ -4442,6 +4448,7 @@ from cron.scheduler_delivery import (
 )
 from cron.scheduler_script import (
     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
+    maybe_run_post_script,
 )
 from cron.scheduler_prompt import (
     _PROMPT_FRAME, _PROMPT_HEADING, _PROMPT_SEPARATOR, _RESPONSE_FRAME, _RESPONSE_HEADING,
