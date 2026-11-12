@@ -1290,12 +1290,19 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         return False
 
     def _run_agent_start_turn_worker(self, turn_ctx: TurnContext, run_sync: Callable[[], Any]) -> GatewayRunner._RunAgentWorker:
-        """Schedule ``run_sync`` on the executor plus the inactivity watchdog thread.
+        """Schedule ``run_sync`` on the executor plus the turn watchdog thread.
 
-        *Inactivity* timeout (agent.gateway_timeout / HERMES_AGENT_TIMEOUT, env wins; 0 = unlimited),
-        not wall-clock. The daemon watchdog is independent of asyncio: cgroup memory reclaim can
+        Inactivity (agent.gateway_timeout) fires only when the agent is silent.
+        Wall-clock and output-token caps fire while a stream is still arriving.
+        The daemon watchdog is independent of asyncio: cgroup memory reclaim can
         starve the loop that runs the normal timeout poll."""
         from gateway.run import _float_env, _watch_gateway_turn_inactivity
+        from gateway.session_finite import unattended_turn
+        from gateway.turn_runaway import (
+            output_token_budget,
+            turn_is_unattended,
+            wall_timeout_s,
+        )
         from tools.process_registry import process_registry
         agent_holder, session_key, run_generation = turn_ctx.agent_holder, turn_ctx.session_key, turn_ctx.run_generation
         _agent_timeout, _agent_warning = (
@@ -1341,11 +1348,18 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     _finished_agent._gateway_turn_process_task_id = ""
                     _finished_agent._gateway_turn_process_baseline = frozenset()
 
-        if _agent_timeout is not None:
+        _unattended = turn_is_unattended(turn_ctx.source, unattended_flag=unattended_turn())
+        _wall_timeout = wall_timeout_s(unattended=_unattended)
+        _output_budget = output_token_budget(unattended=_unattended)
+        if _agent_timeout is not None or _wall_timeout is not None or _output_budget is not None:
             threading.Thread(
                 target=_watch_gateway_turn_inactivity,
                 kwargs={
-                    "agent_holder": agent_holder, "timeout": _agent_timeout, "poll_interval": 5.0,
+                    "agent_holder": agent_holder,
+                    "timeout": _agent_timeout,
+                    "wall_timeout": _wall_timeout,
+                    "output_token_budget": _output_budget,
+                    "poll_interval": 5.0,
                     **self._reaper_kwargs(worker),
                 },
                 name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",

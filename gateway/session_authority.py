@@ -439,6 +439,10 @@ class SessionAuthority:
                                         then=partial(reopen_if_reattached, self, session_id))
                     if orphaned:  # a plain session.detach is a live client handing the session back
                         from gateway.session_viewer_close import arm_detached_orphan_close
+                        from gateway.turn_runaway import interrupt_unwatched_unattended
+                        # hermes -z / cron have no one left to read the reply. Stop the
+                        # model now; the orphan close still ends the session once idle.
+                        interrupt_unwatched_unattended(self, session_id)
                         await arm_detached_orphan_close(self, session_id)
                 return
         raise RuntimeStoreError('not_found')

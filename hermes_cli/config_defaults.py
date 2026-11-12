@@ -74,6 +74,15 @@ DEFAULT_CONFIG = {
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
+        # Wall-clock cap (seconds) for one gateway turn, counted only while the host is awake.
+        # Fires even while tokens or tool calls are still arriving. 0 = off.
+        # Unattended turns (hermes -z, cron) use gateway_turn_wall_unattended_s instead.
+        "gateway_turn_wall_s": 3600,
+        "gateway_turn_wall_unattended_s": 720,
+        # Completion-token cap for one gateway turn, summed across every model call.
+        # 0 = off. Unattended turns use gateway_turn_output_tokens_unattended.
+        "gateway_turn_output_tokens": 0,
+        "gateway_turn_output_tokens_unattended": 24000,
         # Max seconds an alias routing key waits for the active turn holding the same session lease;
         # on expiry the message is rejected with a resend notice. Keep short: Telegram dispatches
         # sequentially, so a waiter delays unrelated topics. Non-positive -> 5s.
