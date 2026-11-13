@@ -1200,6 +1200,41 @@ def _cron_inactivity_seconds() -> float:
         return 600.0
 
 
+def _cron_wall_seconds() -> float:
+    """Wall-clock cap for one cron agent run. Streaming tokens do not reset it.
+
+    HERMES_CRON_WALL_TIMEOUT (seconds). 0 = off. Unset or bad input = 900, one
+    electrum-sweep slot, so a model that never stops cannot hold the schedule
+    for hours.
+    """
+    raw = cron_env_setting("HERMES_CRON_WALL_TIMEOUT").strip()
+    if not raw:
+        return 900.0
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        logger.warning("Invalid HERMES_CRON_WALL_TIMEOUT=%r; using default 900s", raw)
+        return 900.0
+
+
+def _cron_max_output_tokens(job: dict) -> int | None:
+    """Output cap sent on each cron model call. A job ``max_tokens`` wins.
+
+    Unset means 10240. 0 or a negative value sends no cap. Without a cap a
+    local server generates until the context window is full.
+    """
+    raw = job.get("max_tokens")
+    if raw is None:
+        env = cron_env_setting("HERMES_CRON_MAX_TOKENS").strip()
+        raw = env or "10240"
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid cron max_tokens %r; using default 10240", raw)
+        return 10240
+    return value if value > 0 else None
+
+
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool for the ACTIVE profile.
 
@@ -1910,6 +1945,18 @@ def _open_cron_session_db(job: dict):
     return None
 
 
+def _raise_wall_timeout(agent, job_name: str, limit_s: float, elapsed_s: float) -> None:
+    """Hard-interrupt a cron run that is still streaming past its wall clock."""
+    logger.error(
+        "Job '%s' still running after %.0fs (wall-clock limit %.0fs)",
+        job_name, elapsed_s, limit_s)
+    request_hard_interrupt(
+        agent, "Cron job timed out (wall clock)", tool_reason="cron wall-clock watchdog")
+    raise TimeoutError(
+        f"Cron job '{job_name}' still running after {int(elapsed_s)}s "
+        f"(wall-clock limit {int(limit_s)}s)")
+
+
 def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
     """Log the agent's last activity, hard-interrupt it and raise TimeoutError."""
     _activity = {}
@@ -1935,10 +1982,17 @@ def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
     worker_state: Optional[dict] = None,
 ) -> dict:
-    """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
-    watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
+    """Run ``agent.run_conversation`` on a worker thread.
+
+    Inactivity (HERMES_CRON_TIMEOUT, default 600s, 0 = off) fires only when the
+    agent goes silent. Wall clock (HERMES_CRON_WALL_TIMEOUT, default 900s, 0 = off)
+    fires even while tokens are still arriving.
+    """
     _cron_timeout = _cron_inactivity_seconds()
     _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+    _cron_wall = _cron_wall_seconds()
+    _cron_wall_limit = _cron_wall if _cron_wall > 0 else None
+    _wall_started = time.monotonic()
     _POLL_INTERVAL = 5.0
     # Heartbeat the one-shot run_claim while alive: without it a long run looks like a dead owner
     # and gets re-dispatched / stale-removed out from under the live run.
@@ -1984,6 +2038,7 @@ def _run_agent_with_watchdog(
     if worker_state is not None:
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
+    _wall_timeout = False
     _watch_stop = threading.Event()
 
     def _idle_seconds() -> float:
@@ -2017,7 +2072,12 @@ def _run_agent_with_watchdog(
             # loop / hung ``get_activity_summary`` on this thread can no longer keep the 600s inactivity
             # limit from firing (#94285).
             _watch_thread.start()
-        if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+        if (
+            _cron_inactivity_limit is None
+            and _cron_wall_limit is None
+            and not _is_oneshot
+            and cancel_event is None
+        ):
             result = _cron_future.result()
         else:
             result = None
@@ -2029,6 +2089,11 @@ def _run_agent_with_watchdog(
                     break
                 if _inactivity_timeout:
                     break
+                if _cron_wall_limit is not None:
+                    _elapsed = time.monotonic() - _wall_started
+                    if _elapsed >= _cron_wall_limit:
+                        _wall_timeout = True
+                        break
                 _abort_if_fire_claim_lost()
                 _heartbeat_run_claim_if_due()
                 _progress.tick()
@@ -2039,6 +2104,8 @@ def _run_agent_with_watchdog(
         _watch_stop.set()
         _cron_pool.shutdown(wait=False, cancel_futures=True)
 
+    if _wall_timeout:
+        _raise_wall_timeout(agent, job_name, _cron_wall_limit, time.monotonic() - _wall_started)
     if _inactivity_timeout:
         _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
 
@@ -2501,6 +2568,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
         disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
         quiet_mode=True,
+        max_tokens=_cron_max_output_tokens(job),
         # Project context files only with a configured workdir; SOUL.md always.
         skip_context_files=not bool(workdir),
         load_soul_identity=True,
