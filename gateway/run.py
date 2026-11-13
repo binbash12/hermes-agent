@@ -1926,6 +1926,10 @@ os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(_DEFAULT_CONFIG["agent"]["gateway_
 # over .env for these keys; a `not in os.environ` guard would let stale .env entries shadow config.
 _AGENT_ENV_BRIDGE = {
     "gateway_timeout": "HERMES_AGENT_TIMEOUT",
+    "gateway_turn_wall_s": "HERMES_GATEWAY_TURN_WALL_S",
+    "gateway_turn_wall_unattended_s": "HERMES_GATEWAY_TURN_WALL_UNATTENDED_S",
+    "gateway_turn_output_tokens": "HERMES_GATEWAY_TURN_OUTPUT_TOKENS",
+    "gateway_turn_output_tokens_unattended": "HERMES_GATEWAY_TURN_OUTPUT_TOKENS_UNATTENDED",
     "gateway_turn_lease_timeout": "HERMES_TURN_LEASE_TIMEOUT",
     "gateway_timeout_warning": "HERMES_AGENT_TIMEOUT_WARNING",
     "gateway_notify_interval": "HERMES_AGENT_NOTIFY_INTERVAL",
@@ -2575,8 +2579,12 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
+_INTERRUPT_REASON_WALL = "Execution timed out (wall clock)"
+_INTERRUPT_REASON_OUTPUT = "Execution timed out (output token budget)"
 # ``tool_reason`` for the inactivity timeout: attributes the stop to the gateway watchdog (#112647).
 _INTERRUPT_TOOL_REASON_TIMEOUT = "gateway inactivity watchdog"
+_INTERRUPT_TOOL_REASON_WALL = "gateway wall-clock watchdog"
+_INTERRUPT_TOOL_REASON_OUTPUT = "gateway output token budget"
 _INTERRUPT_REASON_EVICTED = "Session ended while the turn was running"
 # ``tool_reason`` for eviction / shutdown: these stops are system-issued, not user stops (#112647).
 _INTERRUPT_TOOL_REASON_EVICTED = "session evicted"
@@ -2661,7 +2669,8 @@ def _dump_wedged_turn_stacks(task_id: str) -> None:
 def _abandon_timed_out_gateway_turn(
     *, agent_holder, task_id: str, process_baseline, worker_done: threading.Event,
     timeout_fired: threading.Event, cleanup_lock: threading.Lock,
-    is_still_current: Optional[Callable[[], bool]] = None) -> bool:
+    is_still_current: Optional[Callable[[], bool]] = None,
+    reason: str | None = None, tool_reason: str | None = None) -> bool:
     """Interrupt one timed-out turn and reap only processes it created."""
     with cleanup_lock:
         if worker_done.is_set() or timeout_fired.is_set():
@@ -2674,7 +2683,11 @@ def _abandon_timed_out_gateway_turn(
     agent = agent_holder[0] if agent_holder else None
     if agent is not None:
         try:
-            request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT, tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT)
+            request_hard_interrupt(
+                agent,
+                reason or _INTERRUPT_REASON_TIMEOUT,
+                tool_reason=tool_reason or _INTERRUPT_TOOL_REASON_TIMEOUT,
+            )
         except Exception:
             logger.debug("Timed-out agent interrupt failed", exc_info=True)
         from hermes_cli.observability.shared_metrics_process import record_watchdog_turn_abort
@@ -2691,16 +2704,25 @@ def _abandon_timed_out_gateway_turn(
 
 
 def _watch_gateway_turn_inactivity(
-    *, agent_holder, task_id: str, process_baseline, timeout: float, worker_done: threading.Event,
+    *, agent_holder, task_id: str, process_baseline, timeout: float | None,
+    worker_done: threading.Event,
     timeout_fired: threading.Event, cleanup_lock: threading.Lock, poll_interval: float = 5.0,
-    is_still_current: Optional[Callable[[], bool]] = None) -> None:
+    is_still_current: Optional[Callable[[], bool]] = None,
+    wall_timeout: float | None = None, output_token_budget: int | None = None) -> None:
     """Thread watchdog that remains runnable when gateway asyncio is starved.
 
     Until an agent publishes a usable activity snapshot, elapsed worker time is the
     liveness clock.  Otherwise a provider hang before activity initialization can
     retain the session turn lease forever because every watchdog poll just skips it.
+
+    ``timeout`` is silence. ``wall_timeout`` is awake time since this thread started,
+    so a stream that never goes idle still ends. ``output_token_budget`` sums model
+    output across the turn.
     """
-    activity_origin = time.monotonic()
+    from gateway.turn_runaway import output_tokens
+
+    started = time.monotonic()
+    activity_origin = started
     awake_idle = AwakeIdleMeter()  # host sleep is not idleness
     while not worker_done.wait(max(0.01, poll_interval)):
         now = time.monotonic()
@@ -2716,18 +2738,29 @@ def _watch_gateway_turn_inactivity(
                     activity_origin = now - idle_seconds
             except Exception:
                 pass
-        if idle_seconds < timeout:
+        reason = tool_reason = None
+        if wall_timeout is not None and (now - started) >= wall_timeout:
+            reason, tool_reason = _INTERRUPT_REASON_WALL, _INTERRUPT_TOOL_REASON_WALL
+        elif (
+            output_token_budget is not None
+            and agent is not None
+            and output_tokens(agent) >= output_token_budget
+        ):
+            reason, tool_reason = _INTERRUPT_REASON_OUTPUT, _INTERRUPT_TOOL_REASON_OUTPUT
+        elif timeout is None or idle_seconds < timeout:
             continue
         _abandon_timed_out_gateway_turn(
             agent_holder=agent_holder, task_id=task_id, process_baseline=process_baseline,
             worker_done=worker_done, timeout_fired=timeout_fired, cleanup_lock=cleanup_lock,
-            is_still_current=is_still_current)
+            is_still_current=is_still_current, reason=reason, tool_reason=tool_reason)
         return
 
 
 _CONTROL_INTERRUPT_MESSAGES = frozenset({
     _INTERRUPT_REASON_STOP.lower(), _INTERRUPT_REASON_RESET.lower(),
-    _INTERRUPT_REASON_TIMEOUT.lower(), _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
+    _INTERRUPT_REASON_TIMEOUT.lower(), _INTERRUPT_REASON_WALL.lower(),
+    _INTERRUPT_REASON_OUTPUT.lower(), "submitter disconnected",
+    _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
     _INTERRUPT_REASON_EVICTED.lower(), _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
     _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
 
