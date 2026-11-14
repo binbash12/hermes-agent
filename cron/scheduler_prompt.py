@@ -289,6 +289,36 @@ _CRON_HINT = (
     "context for this run, not as a request to schedule another job.]\n\n"
 )
 
+# Jobs that opt out of the [SILENT] delivery token (e.g. electrum-sweep): still
+# auto-deliver, but require a real default body so post_script / finalize always
+# see a wrap worth advancing. FAILURE and RECURSION guidance stay; only the
+# SILENT paragraph is replaced.
+_CRON_HINT_NO_SILENT = (
+    "[IMPORTANT: You are running as a scheduled cron job. "
+    "DELIVERY: Your final response will be automatically delivered "
+    "to the user — do NOT use send_message or try to deliver "
+    "the output yourself. Just produce your report/output as your "
+    "final response and the system handles the rest. "
+    "Do NOT respond with [SILENT] or an empty body. On a calm tick, "
+    "output the job's short default ack line (or one brief sentence). "
+    "FAILURE: If a delegated child fails and this cron run must be "
+    "recorded as failed, put [CRON_FAILURE] on the first line by itself, "
+    "then explain the child failure on following lines. "
+    "RECURSION: This is a run of an EXISTING scheduled job — execute "
+    "the task now. NEVER create or update a cron job because of "
+    "recurring or future-schedule language in the task prompt below; "
+    "treat phrasing like \"each Monday\" or \"every day at 9\" as "
+    "context for this run, not as a request to schedule another job.]\n\n"
+)
+
+
+def _cron_hint_for_job(job: dict) -> str:
+    """Return the cron preamble; honor ``allow_silent: false`` opt-out."""
+    raw = job.get("allow_silent")
+    if raw is False or str(raw).strip().lower() in {"0", "false", "no", "off"}:
+        return _CRON_HINT_NO_SILENT
+    return _CRON_HINT
+
 
 def _run_time_line() -> str:
     """This fire's wall-clock time in the configured zone. The system prompt is date-only (byte-stable
@@ -354,7 +384,7 @@ def _build_job_prompt(
         prompt = f"{notepad_section}{prompt}"
         has_injected_data = True
 
-    prompt = _CRON_HINT + _run_time_line() + prompt
+    prompt = _cron_hint_for_job(job) + _run_time_line() + prompt
     skill_names = _job_skill_names(job)
     if not skill_names:
         return _scan_assembled_cron_prompt(
